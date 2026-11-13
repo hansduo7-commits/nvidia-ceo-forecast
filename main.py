@@ -6,16 +6,16 @@ For every market in a case it writes five quantiles (0.05, 0.25, 0.5, 0.75, 0.95
 of the Yes price at each of the 240 minutes after the checkpoint.
 
 Method
-  1. Anchor (the median): the last price, unless the last few minutes are a
-     fresh spike far from the 60-minute median; such spikes tend to revert, so
-     the anchor is pulled toward that median.
+  1. Median: the last price, pulled down over the first hour by the board's
+     excess when the prices of these mutually exclusive outcomes sum above 1.
   2. Spread: empirical h-minute price changes, scaled by sqrt(p(1-p)) so that
      markets at different price levels can be pooled. The first minutes of a
      market's history (opening prints around 0.5) are skipped. Quantiles of the
      changes are taken at a ladder of horizons and interpolated in sqrt(h).
   3. The market's own quantiles are blended with the pooled ones (mostly pooled:
-     single markets have few, lumpy moves), shrunk by a spread multiplier, given
-     a minimum band, clamped to [0, 1] and made monotone.
+     single markets have few, lumpy moves), scaled by the market's last-12-hour
+     activity, with separate multipliers for the inner and outer quantiles, a
+     minimum band, clamped to [0, 1] and made monotone.
 """
 import json
 import math
@@ -25,11 +25,11 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 LADDER = (1, 2, 4, 8, 15, 30, 60, 120, 180, 240)
 SKIP_OPEN = 360      # opening minutes of each market that are ignored
 OWN_WEIGHT = 0.05    # weight of a market's own change distribution vs the pool
-SPREAD_MULT = 0.75   # multiplier on the empirical spread
+MULT_INNER = 1.0     # multiplier on the empirical 25%/75% offsets
+MULT_OUTER = 0.6     # multiplier on the empirical 5%/95% offsets
+SUM_POW = 1.0        # strength of the pull when the board's prices sum above 1
 REGIME_MIN = 720     # recent window (12 h) for a market's activity level
 REGIME_POW = 0.5     # spread scales with (recent activity / pooled activity) ** REGIME_POW
-SPIKE_WINDOW = 15    # a level held for at most this many minutes may be a spike
-MED_WINDOW = 60      # window of the reference median for spike detection
 
 
 def qtile(sorted_vals, p):
@@ -52,23 +52,6 @@ def usable(prices):
     """Drop the opening minutes; keep at least two thirds of a short history."""
     skip = min(SKIP_OPEN, len(prices) // 3)
     return prices[skip:]
-
-
-def anchor(prices):
-    x = prices[-1]
-    if len(prices) < MED_WINDOW:
-        return x
-    med = qtile(sorted(prices[-MED_WINDOW:]), 0.5)
-    held = 0
-    for v in reversed(prices):
-        if abs(v - x) <= 0.005:
-            held += 1
-        else:
-            break
-    dev = x - med
-    if held <= SPIKE_WINDOW and abs(dev) > max(0.02, 0.25 * med):
-        return med + dev * held / SPIKE_WINDOW
-    return x
 
 
 def scaled_changes(prices, h):
@@ -133,10 +116,17 @@ def forecast(case):
         s = sorted(pool[h])
         pooled.append([qtile(s, p) for p in LEVELS])
     gain = regime_gain(markets, hist)
+    # The markets are mutually exclusive outcomes: when their prices add up to
+    # more than 1 the excess tends to bleed out, proportionally, over the next hour.
+    board = sum(m["prices"][-1] for m in markets)
+    shrink = min(1.0, 1.0 / board) if board > 0 else 1.0
+    mult = (MULT_OUTER, MULT_INNER, 0.0, MULT_INNER, MULT_OUTER)
 
     result = []
     for m in markets:
-        x = anchor(m["prices"])
+        # Backtests: pulling a fresh spike toward its recent median hurt, so the
+        # anchor is the last price itself.
+        x = m["prices"][-1]
         sc = price_scale(x) * gain[m["id"]]
         table = []
         for k, h in enumerate(LADDER):
@@ -146,11 +136,12 @@ def forecast(case):
         q = []
         for h in range(1, horizon + 1):
             d = interp(table, h)
-            row = [x + v * sc * SPREAD_MULT for v in d]
-            row[2] = x
+            c = x * shrink ** (SUM_POW * min(1.0, h / 60.0))
+            row = [c + v * sc * mu for v, mu in zip(d, mult)]
+            row[2] = c
             band = 0.0005 + 0.00004 * h
-            row[0] = min(row[0], x - band)
-            row[4] = max(row[4], x + band)
+            row[0] = min(row[0], c - band)
+            row[4] = max(row[4], c + band)
             row = [min(1.0, max(0.0, v)) for v in row]
             for k in range(1, 5):
                 if row[k] < row[k - 1]:
