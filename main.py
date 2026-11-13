@@ -23,9 +23,11 @@ import os
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 LADDER = (1, 2, 4, 8, 15, 30, 60, 120, 180, 240)
-SKIP_OPEN = 180      # opening minutes of each market that are ignored
+SKIP_OPEN = 360      # opening minutes of each market that are ignored
 OWN_WEIGHT = 0.05    # weight of a market's own change distribution vs the pool
-SPREAD_MULT = 0.7    # multiplier on the empirical spread (backtest: 0.6-0.8 best, 0.7 kept as a hedge)
+SPREAD_MULT = 0.75   # multiplier on the empirical spread
+REGIME_MIN = 720     # recent window (12 h) for a market's activity level
+REGIME_POW = 0.5     # spread scales with (recent activity / pooled activity) ** REGIME_POW
 SPIKE_WINDOW = 15    # a level held for at most this many minutes may be a spike
 MED_WINDOW = 60      # window of the reference median for spike detection
 
@@ -88,6 +90,29 @@ def interp(table, h):
     return table[-1][1]
 
 
+def regime_gain(markets, hist):
+    """Per-market spread gain: how active the market has been over the last
+    12 hours (mean |15-minute scaled change|) relative to all markets' whole
+    history, lightly smoothed, raised to REGIME_POW and bounded."""
+    all_moves = []
+    recent = {}
+    for m in markets:
+        s = hist[m["id"]]
+        a = [abs(s[i + 15] - s[i]) / price_scale(s[i]) for i in range(len(s) - 15)]
+        all_moves.extend(a)
+        r = a[-REGIME_MIN:]
+        recent[m["id"]] = sum(r) / len(r) if r else None
+    base = sum(all_moves) / len(all_moves) if all_moves else 0.0
+    gain = {}
+    for k, v in recent.items():
+        if v is None or base <= 0:
+            gain[k] = 1.0
+        else:
+            g = ((v + 0.1 * base) / (1.1 * base)) ** REGIME_POW
+            gain[k] = min(3.0, max(0.33, g))
+    return gain
+
+
 def forecast(case):
     horizon = int(case.get("horizon_minutes", 240))
     markets = case["markets"]
@@ -107,11 +132,12 @@ def forecast(case):
     for h in LADDER:
         s = sorted(pool[h])
         pooled.append([qtile(s, p) for p in LEVELS])
+    gain = regime_gain(markets, hist)
 
     result = []
     for m in markets:
         x = anchor(m["prices"])
-        sc = price_scale(x)
+        sc = price_scale(x) * gain[m["id"]]
         table = []
         for k, h in enumerate(LADDER):
             n, q_own = own[m["id"]][k]
