@@ -1,149 +1,137 @@
-"""Forecaster for make.fun's polymarket-nvidia-ceo-forecast-01 (Python 3.13, standard library only).
+"""Quantile forecaster for make.fun's polymarket-nvidia-ceo-forecast-01.
 
-For each market it forecasts five quantiles of the Yes price at every minute of the next 240, from the
-72 hours of 1-minute prices up to the checkpoint.
+Python 3.13, standard library only, deterministic.
 
-Method (deterministic, no randomness):
-  * anchor: the price at the checkpoint, unless it is an isolated spike (far from the recent median and only
-    a few minutes old), in which case the anchor is pulled toward the recent median, since such spikes revert;
-  * spread: empirical quantiles of the market's own h-minute price changes over its history (skipping the
-    junk minutes right after a market opens), at a ladder of horizons, interpolated in sqrt(h);
-  * shrinkage: those empirical quantiles are blended with a pooled, price-scaled distribution so thin or
-    quiet histories still get a sensible spread; then clamped to [0, 1] and made monotone.
+For every market in a case it writes five quantiles (0.05, 0.25, 0.5, 0.75, 0.95)
+of the Yes price at each of the 240 minutes after the checkpoint.
+
+Method
+  1. Anchor (the median): the last price, unless the last few minutes are a
+     fresh spike far from the 60-minute median; such spikes tend to revert, so
+     the anchor is pulled toward that median.
+  2. Spread: empirical h-minute price changes, scaled by sqrt(p(1-p)) so that
+     markets at different price levels can be pooled. The first minutes of a
+     market's history (opening prints around 0.5) are skipped. Quantiles of the
+     changes are taken at a ladder of horizons and interpolated in sqrt(h).
+  3. The market's own quantiles are blended with the pooled ones (mostly pooled:
+     single markets have few, lumpy moves), shrunk by a spread multiplier, given
+     a minimum band, clamped to [0, 1] and made monotone.
 """
 import json
 import math
 import os
-import sys
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-LADDER = [1, 2, 4, 8, 15, 30, 60, 120, 180, 240]
-SKIP_OPEN = 180          # minutes after a market's first price that are ignored (opening junk at ~0.5)
-LOOKBACK = 4320          # minutes of history used for the empirical changes
-W_OWN = 0.15             # weight of the market's own empirical quantiles vs the pooled ones
-SPIKE_MIN = 15           # recent-median window for spike detection
-FLOOR = 0.0005
-SPREAD = 0.8             # multiplier on the empirical spread
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+LADDER = (1, 2, 4, 8, 15, 30, 60, 120, 180, 240)
+SKIP_OPEN = 180      # opening minutes of each market that are ignored
+OWN_WEIGHT = 0.05    # weight of a market's own change distribution vs the pool
+SPREAD_MULT = 0.7    # multiplier on the empirical spread (backtest: 0.6-0.8 best, 0.7 kept as a hedge)
+SPIKE_WINDOW = 15    # a level held for at most this many minutes may be a spike
+MED_WINDOW = 60      # window of the reference median for spike detection
 
 
-def quantile(sorted_vals, p):
+def qtile(sorted_vals, p):
     n = len(sorted_vals)
     if n == 0:
         return 0.0
     pos = p * (n - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, n - 1)
-    f = pos - lo
-    return sorted_vals[lo] * (1 - f) + sorted_vals[hi] * f
+    i = int(pos)
+    j = min(i + 1, n - 1)
+    f = pos - i
+    return sorted_vals[i] * (1.0 - f) + sorted_vals[j] * f
 
 
-def median(vals):
-    s = sorted(vals)
-    return quantile(s, 0.5)
+def price_scale(p):
+    p = min(max(p, 0.01), 0.99)
+    return math.sqrt(p * (1.0 - p))
 
 
-def clean_series(prices):
-    return prices[SKIP_OPEN:] if len(prices) > SKIP_OPEN + 300 else prices[min(len(prices) // 3, SKIP_OPEN):]
+def usable(prices):
+    """Drop the opening minutes; keep at least two thirds of a short history."""
+    skip = min(SKIP_OPEN, len(prices) // 3)
+    return prices[skip:]
 
 
-def anchor_of(prices):
+def anchor(prices):
     x = prices[-1]
-    if len(prices) < SKIP_OPEN:
+    if len(prices) < MED_WINDOW:
         return x
-    recent = prices[-60:]
-    med = median(recent)
-    # how many trailing minutes the price has sat at (about) its current level
-    run = 0
+    med = qtile(sorted(prices[-MED_WINDOW:]), 0.5)
+    held = 0
     for v in reversed(prices):
-        if abs(v - x) <= 0.0051:
-            run += 1
+        if abs(v - x) <= 0.005:
+            held += 1
         else:
             break
     dev = x - med
-    if run <= SPIKE_MIN and abs(dev) > max(0.02, 0.25 * med):
-        w = run / SPIKE_MIN
-        return med + w * dev
+    if held <= SPIKE_WINDOW and abs(dev) > max(0.02, 0.25 * med):
+        return med + dev * held / SPIKE_WINDOW
     return x
 
 
-def rel_changes(prices, h):
-    """h-minute changes divided by a price scale, so markets at different levels can be pooled."""
+def scaled_changes(prices, h):
     out = []
-    n = len(prices)
-    step = 1 if n < 2000 else 2
-    for i in range(0, n - h, step):
+    for i in range(len(prices) - h):
         a = prices[i]
-        out.append((prices[i + h] - a) / scale(a))
+        out.append((prices[i + h] - a) / price_scale(a))
     return out
 
 
-def scale(p):
-    # moves are larger for prices near the middle; floor so tiny prices still move a tick
-    return math.sqrt(max(p, 0.01) * (1 - min(p, 0.99)))
-
-
-def interp_sqrt(table, h):
-    """table: list of (h, [5 values]) at LADDER; interpolate linearly in sqrt(h)."""
-    for k in range(len(table) - 1):
-        h0, v0 = table[k]
-        h1, v1 = table[k + 1]
-        if h0 <= h <= h1:
+def interp(table, h):
+    """table: [(h, [5 values])] on LADDER; linear in sqrt(h)."""
+    if h <= table[0][0]:
+        return table[0][1]
+    for (h0, v0), (h1, v1) in zip(table, table[1:]):
+        if h <= h1:
             t = (math.sqrt(h) - math.sqrt(h0)) / (math.sqrt(h1) - math.sqrt(h0))
             return [a + (b - a) * t for a, b in zip(v0, v1)]
     return table[-1][1]
 
 
-def forecast_case(case):
-    H = case["horizon_minutes"]
+def forecast(case):
+    horizon = int(case.get("horizon_minutes", 240))
     markets = case["markets"]
-    series = {m["id"]: clean_series(m["prices"][-LOOKBACK:]) for m in markets}
+    hist = {m["id"]: usable(m["prices"]) for m in markets}
 
+    pool = {h: [] for h in LADDER}
     own = {}
-    pooled_lists = {h: [] for h in LADDER}
     for m in markets:
-        s = series[m["id"]]
-        tbl = []
+        rows = []
         for h in LADDER:
-            ch = rel_changes(s, h)
-            pooled_lists[h].extend(ch)
-            sc = sorted(ch)
-            tbl.append((h, [quantile(sc, p) for p in LEVELS] if len(sc) >= 30 else None, len(sc)))
-        own[m["id"]] = tbl
+            ch = scaled_changes(hist[m["id"]], h)
+            pool[h].extend(ch)
+            ch.sort()
+            rows.append((len(ch), [qtile(ch, p) for p in LEVELS]))
+        own[m["id"]] = rows
     pooled = []
     for h in LADDER:
-        sc = sorted(pooled_lists[h])
-        pooled.append((h, [quantile(sc, p) for p in LEVELS]))
+        s = sorted(pool[h])
+        pooled.append([qtile(s, p) for p in LEVELS])
 
-    out = []
+    result = []
     for m in markets:
-        prices = m["prices"]
-        x = anchor_of(prices)
-        sc = scale(x)
+        x = anchor(m["prices"])
+        sc = price_scale(x)
         table = []
-        for (h, q_own, n), (_, q_pool) in zip(own[m["id"]], pooled):
-            if q_own is None:
-                q = q_pool
-            else:
-                w = W_OWN * min(1.0, n / 600)
-                q = [w * a + (1 - w) * b for a, b in zip(q_own, q_pool)]
-            # never narrower than one tick-ish band at the outer levels
-            q = list(q)
-            table.append((h, q))
-        rows = []
-        for h in range(1, H + 1):
-            d = interp_sqrt(table, h)
-            row = [x + v * sc * SPREAD for v in d]
-            row[2] = x + d[2] * sc * 0.0  # median: stay at the anchor
-            lo_band = 0.0005 + 0.00004 * h
-            row[0] = min(row[0], x - lo_band)
-            row[4] = max(row[4], x + lo_band)
+        for k, h in enumerate(LADDER):
+            n, q_own = own[m["id"]][k]
+            w = OWN_WEIGHT * min(1.0, n / 600.0) if n >= 30 else 0.0
+            table.append((h, [w * a + (1.0 - w) * b for a, b in zip(q_own, pooled[k])]))
+        q = []
+        for h in range(1, horizon + 1):
+            d = interp(table, h)
+            row = [x + v * sc * SPREAD_MULT for v in d]
+            row[2] = x
+            band = 0.0005 + 0.00004 * h
+            row[0] = min(row[0], x - band)
+            row[4] = max(row[4], x + band)
             row = [min(1.0, max(0.0, v)) for v in row]
             for k in range(1, 5):
                 if row[k] < row[k - 1]:
                     row[k] = row[k - 1]
-            rows.append([round(v, 6) for v in row])
-        out.append({"id": m["id"], "q": rows})
-    return {"forecasts": out}
+            q.append([round(v, 6) for v in row])
+        result.append({"id": m["id"], "q": q})
+    return {"forecasts": result}
 
 
 def main():
@@ -155,9 +143,8 @@ def main():
             continue
         with open(os.path.join(in_dir, name), encoding="utf-8") as f:
             case = json.load(f)
-        res = forecast_case(case)
         with open(os.path.join(out_dir, name[:-3] + ".out"), "w", encoding="utf-8") as f:
-            json.dump(res, f, separators=(",", ":"))
+            json.dump(forecast(case), f, separators=(",", ":"))
 
 
 if __name__ == "__main__":
